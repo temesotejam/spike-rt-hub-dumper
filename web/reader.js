@@ -6,6 +6,8 @@ export const SPIKE_RT_REGION_BYTES = SPIKE_FLASH_END_ADDRESS - SPIKE_RT_START_AD
 
 const DFUSE_SET_ADDRESS = 0x21;
 const STM32_INTERNAL_FLASH_MAX_UPLOAD = 2048;
+const READ_WINDOW_TRANSFERS = 32;
+const READ_WINDOW_ATTEMPTS = 2;
 
 function commandPayload(command, address) {
   const payload = new ArrayBuffer(5);
@@ -31,6 +33,14 @@ function validateRange(startAddress, length) {
   }
 }
 
+function asMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function hexAddress(address) {
+  return `0x${address.toString(16).padStart(8, "0")}`;
+}
+
 export class SpikeRtReader {
   constructor(device, callbacks = {}) {
     this.device = device;
@@ -50,6 +60,68 @@ export class SpikeRtReader {
     }
   }
 
+  async recoverToIdle() {
+    try {
+      await this.device.abortToIdle();
+      return true;
+    } catch (error) {
+      this.log(`DFU状態の復旧に失敗しました: ${asMessage(error)}`);
+      return false;
+    }
+  }
+
+  async readWindow(output, outputOffset, windowAddress, windowLength, transferSize) {
+    for (let attempt = 1; attempt <= READ_WINDOW_ATTEMPTS; attempt += 1) {
+      try {
+        await this.device.abortToIdle();
+        await this.setAddress(windowAddress);
+        await this.device.abortToIdle();
+
+        let windowOffset = 0;
+        let blockNumber = 2;
+        while (windowOffset < windowLength) {
+          const requested = Math.min(transferSize, windowLength - windowOffset);
+          const absoluteAddress = windowAddress + windowOffset;
+          let data;
+          try {
+            data = await this.device.upload(requested, blockNumber);
+          } catch (error) {
+            throw new Error(
+              `${hexAddress(absoluteAddress)} / block ${blockNumber} のUSB読み出しに失敗しました: ${asMessage(error)}`,
+            );
+          }
+
+          const chunk = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          if (chunk.byteLength !== requested) {
+            throw new Error(
+              `${hexAddress(absoluteAddress)} / block ${blockNumber} の読み戻しサイズが一致しません (${chunk.byteLength}/${requested})。`,
+            );
+          }
+
+          output.set(chunk, outputOffset + windowOffset);
+          windowOffset += chunk.byteLength;
+          blockNumber += 1;
+          this.onProgress(outputOffset + windowOffset, SPIKE_RT_REGION_BYTES);
+        }
+
+        await this.device.abortToIdle();
+        return;
+      } catch (error) {
+        const message = asMessage(error);
+        this.log(
+          `区間 ${hexAddress(windowAddress)}–${hexAddress(windowAddress + windowLength)} の読み出し失敗 (${attempt}/${READ_WINDOW_ATTEMPTS}): ${message}`,
+        );
+        await this.recoverToIdle();
+        if (attempt === READ_WINDOW_ATTEMPTS) {
+          throw new Error(
+            `区間 ${hexAddress(windowAddress)}–${hexAddress(windowAddress + windowLength)} を読み出せませんでした: ${message}`,
+          );
+        }
+        this.log(`同じ区間をアドレス設定からやり直します。`);
+      }
+    }
+  }
+
   async read(
     startAddress = SPIKE_RT_START_ADDRESS,
     length = SPIKE_RT_REGION_BYTES,
@@ -58,42 +130,40 @@ export class SpikeRtReader {
     if (!Number.isInteger(this.device.transferSize) || this.device.transferSize <= 0) {
       throw new Error(`DFU転送サイズが不正です: ${this.device.transferSize}`);
     }
+
     const transferSize = Math.min(
       this.device.transferSize,
       STM32_INTERNAL_FLASH_MAX_UPLOAD,
     );
+    const windowBytes = transferSize * READ_WINDOW_TRANSFERS;
 
     this.log(
-      `読み出し範囲: 0x${startAddress.toString(16)}–0x${(startAddress + length).toString(16)} (${length} bytes)`,
+      `読み出し範囲: ${hexAddress(startAddress)}–${hexAddress(startAddress + length)} (${length} bytes)`,
     );
     this.log(`DFU読み出し転送サイズ: ${transferSize} bytes`);
+    this.log(
+      `安定化モード: 最大${windowBytes} bytesごとにSet Address Pointerを再設定し、UPLOAD blockを2から再開します。`,
+    );
     this.onProgress(0, length);
 
     await this.device.ensureIdle();
-    await this.setAddress(startAddress);
-    await this.device.abortToIdle();
 
     const output = new Uint8Array(length);
     let offset = 0;
-    let blockNumber = 2;
-
-    try {
-      while (offset < length) {
-        const requested = Math.min(transferSize, length - offset);
-        const data = await this.device.upload(requested, blockNumber);
-        const chunk = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-        if (chunk.byteLength !== requested) {
-          throw new Error(
-            `読み戻しサイズが一致しません (block=${blockNumber}, ${chunk.byteLength}/${requested})。`,
-          );
-        }
-        output.set(chunk, offset);
-        offset += chunk.byteLength;
-        blockNumber += 1;
-        this.onProgress(offset, length);
-      }
-    } finally {
-      await this.device.abortToIdle();
+    while (offset < length) {
+      const windowLength = Math.min(windowBytes, length - offset);
+      const windowAddress = startAddress + offset;
+      this.log(
+        `読み出し中: ${hexAddress(windowAddress)}–${hexAddress(windowAddress + windowLength)}`,
+      );
+      await this.readWindow(
+        output,
+        offset,
+        windowAddress,
+        windowLength,
+        transferSize,
+      );
+      offset += windowLength;
     }
 
     return output.buffer;
