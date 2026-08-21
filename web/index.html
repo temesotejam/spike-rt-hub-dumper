@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>SPIKE-RT Hub Dumper</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main class="container">
+    <header class="hero">
+      <p class="eyebrow">SPIKE Prime / SPIKE-RT</p>
+      <h1>Hub Dumper</h1>
+      <p>DFUモードのSPIKE Prime HubからSPIKE-RT領域をWebUSBで読み出し、<code>.bin</code>として保存・既知ファームと照合します。</p>
+      <p class="notice good"><strong>読み出し専用:</strong> 対象は<code>0x08008000–0x08100000</code>の992 KiBです。セクタ消去やファーム書き込みの機能は実装していません。</p>
+    </header>
+
+    <section class="card">
+      <h2>1. HubをDFUモードで接続</h2>
+      <details class="instructions" open>
+        <summary>接続手順</summary>
+        <ol>
+          <li>Hubの電源を切り、USBケーブルを抜きます。</li>
+          <li>Bluetoothボタンを押したままUSBケーブルを接続します。</li>
+          <li>ボタンが赤・緑・青に繰り返し点滅したらボタンを離します。</li>
+          <li>「Hubに接続」を押し、<strong>LEGO Technic Large Hub in DFU Mode</strong>を選びます。</li>
+        </ol>
+      </details>
+      <p class="notice warning"><strong>Windows:</strong> 初回のみDFUモードのHubへWinUSBドライバーを割り当てる必要がある場合があります。</p>
+
+      <dl class="metadata compact">
+        <div><dt>WebUSB</dt><dd id="browser-status">確認中</dd></div>
+        <div><dt>Hub</dt><dd id="device-status">未接続</dd></div>
+        <div><dt>転送サイズ</dt><dd id="transfer-size">—</dd></div>
+      </dl>
+
+      <div class="actions">
+        <button id="connect" type="button">Hubに接続</button>
+        <button id="disconnect" type="button" disabled>接続解除</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>2. SPIKE-RT領域を吸い出す</h2>
+      <p><code>0x08008000</code>からFlash末尾<code>0x08100000</code>直前までを連続読み出しします。アドレス設定以外のDFUダウンロード操作、消去、書き込み、再起動は行いません。</p>
+
+      <div class="actions">
+        <button id="read" type="button" disabled>992 KiBを読み出す</button>
+      </div>
+
+      <p id="progress-label" class="progress-label">待機中</p>
+      <progress id="progress" max="100" value="0"></progress>
+
+      <dl class="metadata">
+        <div><dt>状態</dt><dd id="dump-status">未読み出し</dd></div>
+        <div><dt>保存サイズ</dt><dd id="dump-size">—</dd></div>
+        <div><dt>SHA-256</dt><dd id="dump-sha" class="mono break">—</dd></div>
+        <div><dt>最後の非0xFF</dt><dd id="programmed-bytes">—</dd></div>
+        <div><dt>Initial SP</dt><dd id="stack-pointer">—</dd></div>
+        <div><dt>Reset Handler</dt><dd id="reset-handler">—</dd></div>
+      </dl>
+
+      <div class="actions">
+        <button id="download-bin" type="button" disabled>dump.binを保存</button>
+        <button id="download-metadata" type="button" disabled>metadata.jsonを保存</button>
+      </div>
+      <p class="muted">「最後の非0xFF」は使用量の厳密値ではなく、読み出しデータ末尾側の推定情報です。</p>
+    </section>
+
+    <section class="card">
+      <h2>3. 既知のSPIKE-RTプログラムと照合</h2>
+      <p>既定では<code>spike-rt-web-project</code>のGitHub Pagesカタログを使用します。各既知ファームのサイズ分だけdump先頭をSHA-256化し、ビルド済み<code>asp.bin</code>と完全一致するか確認します。</p>
+
+      <label for="catalog-url">catalog.json URL</label>
+      <input id="catalog-url" type="url" spellcheck="false">
+      <div class="actions">
+        <button id="retry-match" type="button" disabled>もう一度照合</button>
+      </div>
+
+      <dl class="metadata compact">
+        <div><dt>照合結果</dt><dd id="match-status">未照合</dd></div>
+      </dl>
+      <div id="match-details" class="match-details">—</div>
+    </section>
+
+    <section class="card">
+      <h2>ログ</h2>
+      <pre id="log" aria-live="polite">準備完了</pre>
+    </section>
+
+    <footer>
+      <p>LEGO SPIKE Prime Hub / USB DFU (DfuSe) / VID 0694 / PID 0008</p>
+      <p>元のCソースそのものをHubから復元する機能ではありません。取得できるのはコンパイル済みFlashイメージです。</p>
+    </footer>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
