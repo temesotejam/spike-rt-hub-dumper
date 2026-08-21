@@ -347,7 +347,16 @@ export async function connectSpikeDfu(callbacks = {}) {
   }
 
   const matches = findDfuInterfaces(usbDevice);
-  const settings = matches.find((candidate) => candidate.protocol === 0x02) ?? matches[0];
+  const settings =
+    matches.find(
+      (candidate) =>
+        candidate.protocol === 0x02 && /internal\s+flash/i.test(candidate.interfaceName),
+    ) ??
+    matches.find(
+      (candidate) => candidate.protocol === 0x02 && candidate.alternateSetting === 0,
+    ) ??
+    matches.find((candidate) => candidate.protocol === 0x02) ??
+    matches[0];
   if (!settings) {
     throw new Error("USB DFUインターフェースが見つかりません。HubをDFUモードで接続してください。");
   }
