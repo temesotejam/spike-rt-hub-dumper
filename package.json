@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "test": "node --check web/app.js && node --check web/reader.js && node --check web/restore.js && node --test"
   }
 }

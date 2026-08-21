@@ -4,13 +4,15 @@ import { DFU_STATE, DFU_STATUS_OK } from "../web/dfu.js";
 import {
   estimateLastProgrammedByte,
   readVectorTable,
+  SPIKE_FLASH_BYTES,
+  SPIKE_FLASH_START_ADDRESS,
   SPIKE_RT_REGION_BYTES,
   SPIKE_RT_START_ADDRESS,
   SpikeRtReader,
 } from "../web/reader.js";
 
-function makeSource() {
-  const source = new Uint8Array(SPIKE_RT_REGION_BYTES);
+function makeSource(length) {
+  const source = new Uint8Array(length);
   for (let index = 0; index < source.length; index += 1) {
     source[index] = index & 0xff;
   }
@@ -52,14 +54,12 @@ function addStatusMachine(device, initialState = DFU_STATE.IDLE) {
   });
 }
 
-test("reader resets the DfuSe address and block number in bounded windows", async () => {
-  const source = makeSource();
+function makeReadDevice(source, startAddress, transferSize = 2048) {
+  let currentAddress = startAddress;
   const setAddresses = [];
   const blocks = [];
-  let currentAddress = SPIKE_RT_START_ADDRESS;
-
   const device = addStatusMachine({
-    transferSize: 4096,
+    transferSize,
     async download(payload, blockNumber) {
       assert.equal(blockNumber, 0);
       currentAddress = addressFromPayload(payload);
@@ -74,11 +74,21 @@ test("reader resets the DfuSe address and block number in bounded windows", asyn
       blocks.push(blockNumber);
       this.setDfuState(DFU_STATE.UPLOAD_IDLE);
       const absoluteAddress = currentAddress + (blockNumber - 2) * length;
-      const sourceOffset = absoluteAddress - SPIKE_RT_START_ADDRESS;
+      const sourceOffset = absoluteAddress - startAddress;
       const chunk = source.slice(sourceOffset, sourceOffset + length);
       return new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     },
   });
+  return { device, setAddresses, blocks };
+}
+
+test("reader resets the DfuSe address and block number in bounded windows", async () => {
+  const source = makeSource(SPIKE_RT_REGION_BYTES);
+  const { device, setAddresses, blocks } = makeReadDevice(
+    source,
+    SPIKE_RT_START_ADDRESS,
+    4096,
+  );
 
   const reader = new SpikeRtReader(device);
   const dump = new Uint8Array(await reader.read());
@@ -94,8 +104,28 @@ test("reader resets the DfuSe address and block number in bounded windows", asyn
   }
 });
 
+test("reader supports an exact 1 MiB full-flash read without arbitrary ranges", async () => {
+  const source = makeSource(SPIKE_FLASH_BYTES);
+  const { device, setAddresses } = makeReadDevice(source, SPIKE_FLASH_START_ADDRESS);
+  const progress = [];
+  const reader = new SpikeRtReader(device, {
+    onProgress(done, total) {
+      progress.push([done, total]);
+    },
+  });
+
+  const dump = new Uint8Array(
+    await reader.read(SPIKE_FLASH_START_ADDRESS, SPIKE_FLASH_BYTES),
+  );
+
+  assert.deepEqual(dump, source);
+  assert.equal(setAddresses[0], SPIKE_FLASH_START_ADDRESS);
+  assert.equal(progress.at(-1)[0], SPIKE_FLASH_BYTES);
+  assert.equal(progress.at(-1)[1], SPIKE_FLASH_BYTES);
+});
+
 test("reader retries one failed window from a fresh address pointer", async () => {
-  const source = makeSource();
+  const source = makeSource(SPIKE_RT_REGION_BYTES);
   const secondWindow = SPIKE_RT_START_ADDRESS + 64 * 1024;
   const setAddresses = [];
   let currentAddress = SPIKE_RT_START_ADDRESS;
@@ -134,11 +164,11 @@ test("reader retries one failed window from a fresh address pointer", async () =
   assert.equal(setAddresses.filter((address) => address === secondWindow).length, 2);
 });
 
-test("reader rejects a non SPIKE-RT range", async () => {
+test("reader rejects arbitrary subranges", async () => {
   const reader = new SpikeRtReader({ transferSize: 2048 });
   await assert.rejects(
     () => reader.read(SPIKE_RT_START_ADDRESS, 1024),
-    /SPIKE-RT領域/,
+    /固定読み出し/,
   );
 });
 

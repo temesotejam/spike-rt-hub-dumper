@@ -4,16 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>SPIKE-RT Hub Dumper</title>
+  <title>SPIKE-RT Hub Backup & Restore</title>
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
   <main class="container">
     <header class="hero">
       <p class="eyebrow">SPIKE Prime / SPIKE-RT</p>
-      <h1>Hub Dumper</h1>
-      <p>DFUモードのSPIKE Prime HubからSPIKE-RT領域をWebUSBで読み出し、<code>.bin</code>として保存・既知ファームと照合します。</p>
-      <p class="notice good"><strong>読み出し専用:</strong> 対象は<code>0x08008000–0x08100000</code>の992 KiBです。セクタ消去やファーム書き込みの機能は実装していません。</p>
+      <h1>Hub Backup & Restore</h1>
+      <p>DFUモードのSPIKE Prime HubからFlashをバックアップし、SPIKE-RT領域を保存イメージへ完全復元します。</p>
+      <p class="notice good"><strong>安全境界:</strong> 通常の復元機能が消去・書き込みするのは<code>0x08008000–0x08100000</code>だけです。先頭32 KiBの<code>0x08000000–0x08008000</code>はバックアップできますが、復元機能からは書き換えません。</p>
     </header>
 
     <section class="card">
@@ -42,16 +42,13 @@
     </section>
 
     <section class="card">
-      <h2>2. SPIKE-RT領域を吸い出す</h2>
-      <p><code>0x08008000</code>からFlash末尾<code>0x08100000</code>直前までを連続読み出しします。アドレス設定以外のDFUダウンロード操作、消去、書き込み、再起動は行いません。</p>
-
+      <h2>2. SPIKE-RT領域をバックアップ</h2>
+      <p><code>0x08008000–0x08100000</code>の992 KiBを読み出します。普段のSPIKE-RT書き込みで変更される領域で、復元に使用するバックアップです。</p>
       <div class="actions">
         <button id="read" type="button" disabled>992 KiBを読み出す</button>
       </div>
-
       <p id="progress-label" class="progress-label">待機中</p>
       <progress id="progress" max="100" value="0"></progress>
-
       <dl class="metadata">
         <div><dt>状態</dt><dd id="dump-status">未読み出し</dd></div>
         <div><dt>保存サイズ</dt><dd id="dump-size">—</dd></div>
@@ -60,24 +57,72 @@
         <div><dt>Initial SP</dt><dd id="stack-pointer">—</dd></div>
         <div><dt>Reset Handler</dt><dd id="reset-handler">—</dd></div>
       </dl>
-
       <div class="actions">
-        <button id="download-bin" type="button" disabled>dump.binを保存</button>
+        <button id="download-bin" type="button" disabled>program-backup.binを保存</button>
         <button id="download-metadata" type="button" disabled>metadata.jsonを保存</button>
       </div>
-      <p class="muted">「最後の非0xFF」は使用量の厳密値ではなく、読み出しデータ末尾側の推定情報です。</p>
     </section>
 
     <section class="card">
-      <h2>3. 既知のSPIKE-RTプログラムと照合</h2>
-      <p>既定では<code>spike-rt-web-project</code>のGitHub Pagesカタログを使用します。各既知ファームのサイズ分だけdump先頭をSHA-256化し、ビルド済み<code>asp.bin</code>と完全一致するか確認します。</p>
+      <h2>3. 内部Flash 1 MiBを追加バックアップ</h2>
+      <p><code>0x08000000–0x08100000</code>を丸ごと読み出します。これは<strong>読み出し専用</strong>です。先頭32 KiBを含む保険用の完全Flashバックアップとして保存してください。</p>
+      <div class="actions">
+        <button id="read-full" type="button" disabled>1 MiB全Flashを読み出す</button>
+      </div>
+      <p id="full-progress-label" class="progress-label">待機中</p>
+      <progress id="full-progress" max="100" value="0"></progress>
+      <dl class="metadata">
+        <div><dt>状態</dt><dd id="full-status">未読み出し</dd></div>
+        <div><dt>保存サイズ</dt><dd id="full-size">—</dd></div>
+        <div><dt>全Flash SHA-256</dt><dd id="full-sha" class="mono break">—</dd></div>
+        <div><dt>先頭32 KiB SHA-256</dt><dd id="prefix-sha" class="mono break">—</dd></div>
+        <div><dt>SPIKE-RT領域 SHA-256</dt><dd id="full-program-sha" class="mono break">—</dd></div>
+      </dl>
+      <div class="actions">
+        <button id="download-full-bin" type="button" disabled>full-flash-1MiB.binを保存</button>
+        <button id="download-full-metadata" type="button" disabled>full-flash-metadata.jsonを保存</button>
+      </div>
+      <p class="muted">この1 MiBファイルを自動で書き戻す機能は意図的に用意していません。先頭32 KiBの誤消去を防ぐためです。</p>
+    </section>
 
+    <section class="card restore-card">
+      <h2>4. 保存したSPIKE-RT領域へ復元</h2>
+      <p class="notice warning"><strong>ここだけは書き込み操作です。</strong> 選択した992 KiBバックアップで<code>0x08008000–0x08100000</code>を消去・書き戻します。その後、同じ992 KiBを再読み出しし、1 byteずつ比較したうえでSHA-256も確認します。</p>
+
+      <label for="restore-file"><strong>復元するprogram-backup.bin</strong></label>
+      <input id="restore-file" type="file" accept=".bin,application/octet-stream">
+      <label for="restore-metadata" class="secondary-label">metadata.json（任意・選択時はSHA-256を照合）</label>
+      <input id="restore-metadata" type="file" accept=".json,application/json">
+
+      <dl class="metadata">
+        <div><dt>復元ファイル</dt><dd id="restore-file-status">未選択</dd></div>
+        <div><dt>サイズ</dt><dd id="restore-file-size">—</dd></div>
+        <div><dt>SHA-256</dt><dd id="restore-file-sha" class="mono break">—</dd></div>
+        <div><dt>metadata</dt><dd id="restore-metadata-status">未選択</dd></div>
+        <div><dt>復元結果</dt><dd id="restore-status">未実行</dd></div>
+        <div><dt>読み戻しSHA-256</dt><dd id="restore-readback-sha" class="mono break">—</dd></div>
+      </dl>
+
+      <label class="confirm-line">
+        <input id="restore-confirm" type="checkbox">
+        <span><code>0x08008000–0x08100000</code>が消去・書き換えられることを確認しました。先頭32 KiBは変更しません。</span>
+      </label>
+      <div class="actions">
+        <button id="restore" class="danger" type="button" disabled>992 KiBバックアップへ復元</button>
+      </div>
+      <p id="restore-progress-label" class="progress-label">待機中</p>
+      <progress id="restore-progress" max="100" value="0"></progress>
+      <p class="muted">復元成功後は自動再起動しません。検証成功を確認してからUSBを抜き、Hubを通常起動してください。</p>
+    </section>
+
+    <section class="card">
+      <h2>5. 既知のSPIKE-RTプログラムと照合</h2>
+      <p>既定では<code>spike-rt-web-project</code>のGitHub Pagesカタログを使用します。各既知ファームのサイズ分だけバックアップ先頭をSHA-256化し、ビルド済み<code>asp.bin</code>と完全一致するか確認します。</p>
       <label for="catalog-url">catalog.json URL</label>
       <input id="catalog-url" type="url" spellcheck="false">
       <div class="actions">
         <button id="retry-match" type="button" disabled>もう一度照合</button>
       </div>
-
       <dl class="metadata compact">
         <div><dt>照合結果</dt><dd id="match-status">未照合</dd></div>
       </dl>
@@ -91,7 +136,7 @@
 
     <footer>
       <p>LEGO SPIKE Prime Hub / USB DFU (DfuSe) / VID 0694 / PID 0008</p>
-      <p>元のCソースそのものをHubから復元する機能ではありません。取得できるのはコンパイル済みFlashイメージです。</p>
+      <p>バックアップはコンパイル済みFlashイメージです。通常復元はSPIKE-RT領域だけを対象とし、先頭32 KiBを保護します。</p>
     </footer>
   </main>
   <script type="module" src="./app.js"></script>

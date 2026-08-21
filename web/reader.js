@@ -1,7 +1,9 @@
 import { DFU_STATE, DFU_STATUS_OK } from "./dfu.js";
 
+export const SPIKE_FLASH_START_ADDRESS = 0x08000000;
 export const SPIKE_RT_START_ADDRESS = 0x08008000;
 export const SPIKE_FLASH_END_ADDRESS = 0x08100000;
+export const SPIKE_FLASH_BYTES = SPIKE_FLASH_END_ADDRESS - SPIKE_FLASH_START_ADDRESS;
 export const SPIKE_RT_REGION_BYTES = SPIKE_FLASH_END_ADDRESS - SPIKE_RT_START_ADDRESS;
 
 const DFUSE_SET_ADDRESS = 0x21;
@@ -17,18 +19,20 @@ function commandPayload(command, address) {
   return payload;
 }
 
+function isAllowedRange(startAddress, length) {
+  return (
+    (startAddress === SPIKE_RT_START_ADDRESS && length === SPIKE_RT_REGION_BYTES) ||
+    (startAddress === SPIKE_FLASH_START_ADDRESS && length === SPIKE_FLASH_BYTES)
+  );
+}
+
 function validateRange(startAddress, length) {
   if (!Number.isInteger(startAddress) || !Number.isInteger(length) || length <= 0) {
     throw new Error("読み出し範囲が不正です。");
   }
-  const endAddress = startAddress + length;
-  if (
-    startAddress !== SPIKE_RT_START_ADDRESS ||
-    endAddress !== SPIKE_FLASH_END_ADDRESS ||
-    length !== SPIKE_RT_REGION_BYTES
-  ) {
+  if (!isAllowedRange(startAddress, length)) {
     throw new Error(
-      `このツールはSPIKE-RT領域 0x${SPIKE_RT_START_ADDRESS.toString(16)}–0x${SPIKE_FLASH_END_ADDRESS.toString(16)} の読み出しだけを許可します。`,
+      "このツールはSPIKE-RT領域 0x08008000–0x08100000 または内部Flash全体 0x08000000–0x08100000 の固定読み出しだけを許可します。",
     );
   }
 }
@@ -69,9 +73,7 @@ export class SpikeRtReader {
   }
 
   // dfu-util の dfu_abort_to_idle() と同じ順序:
-  // DFU_ABORT -> DFU_GETSTATUS -> dfuIDLE確認。
-  // GETSTATE は使用しない。SPIKE Prime + WinUSB/WebUSB では
-  // GETSTATE が約5秒後に transfer error となる実機挙動が確認されたため。
+  // DFU_ABORT -> DFU_GETSTATUS -> dfuIDLE確認。GETSTATE は使用しない。
   async abortTransferToIdle(context) {
     try {
       await this.device.abort();
@@ -111,7 +113,14 @@ export class SpikeRtReader {
     }
   }
 
-  async readWindow(output, outputOffset, windowAddress, windowLength, transferSize) {
+  async readWindow(
+    output,
+    outputOffset,
+    windowAddress,
+    windowLength,
+    transferSize,
+    totalLength,
+  ) {
     for (let attempt = 1; attempt <= READ_WINDOW_ATTEMPTS; attempt += 1) {
       try {
         await this.setAddress(windowAddress);
@@ -141,7 +150,7 @@ export class SpikeRtReader {
           output.set(chunk, outputOffset + windowOffset);
           windowOffset += chunk.byteLength;
           blockNumber += 1;
-          this.onProgress(outputOffset + windowOffset, SPIKE_RT_REGION_BYTES);
+          this.onProgress(outputOffset + windowOffset, totalLength);
         }
 
         await this.abortTransferToIdle("UPLOAD");
@@ -203,6 +212,7 @@ export class SpikeRtReader {
         windowAddress,
         windowLength,
         transferSize,
+        length,
       );
       offset += windowLength;
     }
