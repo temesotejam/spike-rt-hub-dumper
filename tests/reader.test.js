@@ -23,38 +23,68 @@ function addressFromPayload(payload) {
   return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(1, true);
 }
 
+function addStatusMachine(device, initialState = DFU_STATE.IDLE) {
+  let state = initialState;
+  let getStateCalls = 0;
+  return Object.assign(device, {
+    async ensureIdle() {
+      state = DFU_STATE.IDLE;
+    },
+    async getStatus() {
+      return { state, status: DFU_STATUS_OK, pollTimeout: 0 };
+    },
+    async abort() {
+      state = DFU_STATE.IDLE;
+    },
+    async clearStatus() {
+      state = DFU_STATE.IDLE;
+    },
+    async getState() {
+      getStateCalls += 1;
+      throw new Error("GETSTATE must not be used by the reader");
+    },
+    setDfuState(nextState) {
+      state = nextState;
+    },
+    getStateCallCount() {
+      return getStateCalls;
+    },
+  });
+}
+
 test("reader resets the DfuSe address and block number in bounded windows", async () => {
   const source = makeSource();
   const setAddresses = [];
   const blocks = [];
   let currentAddress = SPIKE_RT_START_ADDRESS;
 
-  const device = {
+  const device = addStatusMachine({
     transferSize: 4096,
-    async ensureIdle() {},
     async download(payload, blockNumber) {
       assert.equal(blockNumber, 0);
       currentAddress = addressFromPayload(payload);
       setAddresses.push(currentAddress);
+      this.setDfuState(DFU_STATE.DNLOAD_IDLE);
       return payload.byteLength;
     },
     async pollUntil() {
       return { state: DFU_STATE.DNLOAD_IDLE, status: DFU_STATUS_OK };
     },
-    async abortToIdle() {},
     async upload(length, blockNumber) {
       blocks.push(blockNumber);
+      this.setDfuState(DFU_STATE.UPLOAD_IDLE);
       const absoluteAddress = currentAddress + (blockNumber - 2) * length;
       const sourceOffset = absoluteAddress - SPIKE_RT_START_ADDRESS;
       const chunk = source.slice(sourceOffset, sourceOffset + length);
       return new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     },
-  };
+  });
 
   const reader = new SpikeRtReader(device);
   const dump = new Uint8Array(await reader.read());
 
   assert.deepEqual(dump, source);
+  assert.equal(device.getStateCallCount(), 0);
   assert.equal(setAddresses[0], SPIKE_RT_START_ADDRESS);
   assert.ok(setAddresses.length > 1);
   assert.equal(blocks.filter((block) => block === 2).length, setAddresses.length);
@@ -71,24 +101,20 @@ test("reader retries one failed window from a fresh address pointer", async () =
   let currentAddress = SPIKE_RT_START_ADDRESS;
   let injectedFailure = false;
 
-  const device = {
+  const device = addStatusMachine({
     transferSize: 2048,
-    async ensureIdle() {},
     async download(payload) {
       currentAddress = addressFromPayload(payload);
       setAddresses.push(currentAddress);
+      this.setDfuState(DFU_STATE.DNLOAD_IDLE);
       return payload.byteLength;
     },
     async pollUntil() {
       return { state: DFU_STATE.DNLOAD_IDLE, status: DFU_STATUS_OK };
     },
-    async abortToIdle() {},
     async upload(length, blockNumber) {
-      if (
-        !injectedFailure &&
-        currentAddress === secondWindow &&
-        blockNumber === 5
-      ) {
+      this.setDfuState(DFU_STATE.UPLOAD_IDLE);
+      if (!injectedFailure && currentAddress === secondWindow && blockNumber === 5) {
         injectedFailure = true;
         throw new Error("simulated USB stall");
       }
@@ -97,17 +123,15 @@ test("reader retries one failed window from a fresh address pointer", async () =
       const chunk = source.slice(sourceOffset, sourceOffset + length);
       return new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     },
-  };
+  });
 
   const reader = new SpikeRtReader(device);
   const dump = new Uint8Array(await reader.read());
 
   assert.deepEqual(dump, source);
+  assert.equal(device.getStateCallCount(), 0);
   assert.equal(injectedFailure, true);
-  assert.equal(
-    setAddresses.filter((address) => address === secondWindow).length,
-    2,
-  );
+  assert.equal(setAddresses.filter((address) => address === secondWindow).length, 2);
 });
 
 test("reader rejects a non SPIKE-RT range", async () => {
