@@ -1,0 +1,8 @@
+{
+  "name": "spike-rt-hub-dumper",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
