@@ -7,14 +7,18 @@ import {
 import {
   estimateLastProgrammedByte,
   readVectorTable,
+  SPIKE_FLASH_BYTES,
   SPIKE_FLASH_END_ADDRESS,
+  SPIKE_FLASH_START_ADDRESS,
   SPIKE_RT_REGION_BYTES,
   SPIKE_RT_START_ADDRESS,
   SpikeRtReader,
 } from "./reader.js";
+import { SpikeRtRestorer, validateRestoreImage } from "./restore.js";
 
 const DEFAULT_CATALOG_URL =
   "https://temesotejam.github.io/spike-rt-web-project/firmware/catalog.json";
+const PREFIX_BYTES = SPIKE_RT_START_ADDRESS - SPIKE_FLASH_START_ADDRESS;
 
 const elements = {
   browserStatus: document.querySelector("#browser-status"),
@@ -33,6 +37,28 @@ const elements = {
   programmedBytes: document.querySelector("#programmed-bytes"),
   stackPointer: document.querySelector("#stack-pointer"),
   resetHandler: document.querySelector("#reset-handler"),
+  readFull: document.querySelector("#read-full"),
+  fullProgress: document.querySelector("#full-progress"),
+  fullProgressLabel: document.querySelector("#full-progress-label"),
+  fullStatus: document.querySelector("#full-status"),
+  fullSize: document.querySelector("#full-size"),
+  fullSha: document.querySelector("#full-sha"),
+  prefixSha: document.querySelector("#prefix-sha"),
+  fullProgramSha: document.querySelector("#full-program-sha"),
+  downloadFullBin: document.querySelector("#download-full-bin"),
+  downloadFullMetadata: document.querySelector("#download-full-metadata"),
+  restoreFile: document.querySelector("#restore-file"),
+  restoreMetadata: document.querySelector("#restore-metadata"),
+  restoreFileStatus: document.querySelector("#restore-file-status"),
+  restoreFileSize: document.querySelector("#restore-file-size"),
+  restoreFileSha: document.querySelector("#restore-file-sha"),
+  restoreMetadataStatus: document.querySelector("#restore-metadata-status"),
+  restoreStatus: document.querySelector("#restore-status"),
+  restoreReadbackSha: document.querySelector("#restore-readback-sha"),
+  restoreConfirm: document.querySelector("#restore-confirm"),
+  restore: document.querySelector("#restore"),
+  restoreProgress: document.querySelector("#restore-progress"),
+  restoreProgressLabel: document.querySelector("#restore-progress-label"),
   matchStatus: document.querySelector("#match-status"),
   matchDetails: document.querySelector("#match-details"),
   catalogUrl: document.querySelector("#catalog-url"),
@@ -43,6 +69,12 @@ const elements = {
 let dfuDevice = null;
 let dump = null;
 let dumpMetadata = null;
+let fullDump = null;
+let fullDumpMetadata = null;
+let restoreImage = null;
+let restoreImageSha = null;
+let restoreMetadataObject = null;
+let restoreMetadataValid = true;
 let busy = false;
 
 function appendLog(message) {
@@ -77,10 +109,23 @@ function updateControls() {
   elements.connect.disabled = busy || !webUsbReady || Boolean(dfuDevice);
   elements.disconnect.disabled = busy || !dfuDevice;
   elements.read.disabled = busy || !dfuDevice;
+  elements.readFull.disabled = busy || !dfuDevice;
   elements.downloadBin.disabled = busy || !dump;
   elements.downloadMetadata.disabled = busy || !dumpMetadata;
+  elements.downloadFullBin.disabled = busy || !fullDump;
+  elements.downloadFullMetadata.disabled = busy || !fullDumpMetadata;
   elements.retryMatch.disabled = busy || !dump;
   elements.catalogUrl.disabled = busy;
+  elements.restoreFile.disabled = busy;
+  elements.restoreMetadata.disabled = busy;
+  elements.restoreConfirm.disabled = busy;
+  elements.restore.disabled =
+    busy ||
+    !dfuDevice ||
+    !restoreImage ||
+    !restoreImageSha ||
+    !restoreMetadataValid ||
+    !elements.restoreConfirm.checked;
 }
 
 function resetDumpResults(status = "未読み出し") {
@@ -98,6 +143,20 @@ function resetDumpResults(status = "未読み出し") {
   elements.matchDetails.textContent = "—";
   elements.progress.value = 0;
   elements.progressLabel.textContent = "待機中";
+  updateControls();
+}
+
+function resetFullResults(status = "未読み出し") {
+  fullDump = null;
+  fullDumpMetadata = null;
+  elements.fullStatus.textContent = status;
+  elements.fullStatus.className = "";
+  elements.fullSize.textContent = "—";
+  elements.fullSha.textContent = "—";
+  elements.prefixSha.textContent = "—";
+  elements.fullProgramSha.textContent = "—";
+  elements.fullProgress.value = 0;
+  elements.fullProgressLabel.textContent = "待機中";
   updateControls();
 }
 
@@ -143,11 +202,34 @@ async function disconnectHub() {
   }
 }
 
-function setProgress(done, total) {
+function updateReadProgress(progress, label, done, total, prefix = "読み出し中") {
   const ratio = total > 0 ? Math.min(1, Math.max(0, done / total)) : 0;
   const percent = ratio * 100;
-  elements.progress.value = percent;
-  elements.progressLabel.textContent = `読み出し中: ${Math.round(percent)}% (${formatBytes(done)} / ${formatBytes(total)})`;
+  progress.value = percent;
+  label.textContent = `${prefix}: ${Math.round(percent)}% (${formatBytes(done)} / ${formatBytes(total)})`;
+}
+
+function setProgress(done, total) {
+  updateReadProgress(elements.progress, elements.progressLabel, done, total);
+}
+
+function setFullProgress(done, total) {
+  updateReadProgress(elements.fullProgress, elements.fullProgressLabel, done, total);
+}
+
+function setRestoreProgress(phase, done, total) {
+  const names = {
+    erase: "セクタ消去",
+    write: "書き戻し",
+    verify: "全域読み戻し検証",
+  };
+  updateReadProgress(
+    elements.restoreProgress,
+    elements.restoreProgressLabel,
+    done,
+    total,
+    names[phase] ?? phase,
+  );
 }
 
 function downloadBlob(blob, filename) {
@@ -159,9 +241,54 @@ function downloadBlob(blob, filename) {
   URL.revokeObjectURL(url);
 }
 
+function timestampForFilename() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
 function dumpFilename() {
-  const compact = new Date().toISOString().replace(/[:.]/g, "-");
-  return `spike-rt-${hex(SPIKE_RT_START_ADDRESS).slice(2)}-${compact}.bin`;
+  return `spike-rt-program-backup-08008000-${timestampForFilename()}.bin`;
+}
+
+function fullDumpFilename() {
+  return `spike-prime-full-flash-08000000-${timestampForFilename()}.bin`;
+}
+
+function createProgramMetadata(buffer, sha256, source = "hub-read") {
+  const programmedBytes = estimateLastProgrammedByte(buffer);
+  const vectors = readVectorTable(buffer);
+  return {
+    tool: "spike-rt-hub-dumper",
+    kind: "spike-rt-program-backup",
+    source,
+    dumpedAt: new Date().toISOString(),
+    startAddress: hex(SPIKE_RT_START_ADDRESS),
+    endAddressExclusive: hex(SPIKE_FLASH_END_ADDRESS),
+    size: buffer.byteLength,
+    sha256,
+    lastNonErasedOffset: programmedBytes,
+    estimatedProgrammedEndAddress:
+      programmedBytes > 0 ? hex(SPIKE_RT_START_ADDRESS + programmedBytes) : null,
+    vectorTable: {
+      initialStackPointer: vectors.initialStackPointer === null ? null : hex(vectors.initialStackPointer),
+      resetHandler: vectors.resetHandler === null ? null : hex(vectors.resetHandler),
+    },
+    matches: [],
+  };
+}
+
+function showProgramMetadata(metadata) {
+  elements.dumpStatus.textContent = "読み出し完了";
+  elements.dumpStatus.className = "status-good";
+  elements.dumpSize.textContent = formatBytes(metadata.size);
+  elements.dumpSha.textContent = metadata.sha256;
+  elements.programmedBytes.textContent =
+    metadata.lastNonErasedOffset > 0
+      ? `${formatBytes(metadata.lastNonErasedOffset)} / 推定終端 ${metadata.estimatedProgrammedEndAddress}`
+      : "すべて0xFF";
+  elements.stackPointer.textContent = metadata.vectorTable.initialStackPointer ?? "—";
+  elements.resetHandler.textContent = metadata.vectorTable.resetHandler ?? "—";
+  elements.progress.value = 100;
+  elements.progressLabel.textContent = `完了: ${formatBytes(metadata.size)}`;
 }
 
 async function matchKnownFirmware() {
@@ -179,22 +306,16 @@ async function matchKnownFirmware() {
 
   try {
     const response = await fetch(catalogUrl, { cache: "no-store" });
-    if (!response.ok) {
-      throw new Error(`catalog.jsonの取得に失敗しました (${response.status})。`);
-    }
+    if (!response.ok) throw new Error(`catalog.jsonの取得に失敗しました (${response.status})。`);
     const catalog = await response.json();
-    if (!Array.isArray(catalog.apps)) {
-      throw new Error("catalog.jsonにapps配列がありません。");
-    }
+    if (!Array.isArray(catalog.apps)) throw new Error("catalog.jsonにapps配列がありません。");
 
     const hashBySize = new Map();
     const matches = [];
     for (const app of catalog.apps) {
       const size = Number(app.size);
       const expectedSha = String(app.sha256 ?? "").toLowerCase();
-      if (!Number.isInteger(size) || size <= 0 || size > dump.byteLength || !expectedSha) {
-        continue;
-      }
+      if (!Number.isInteger(size) || size <= 0 || size > dump.byteLength || !expectedSha) continue;
       let actualSha = hashBySize.get(size);
       if (!actualSha) {
         actualSha = await sha256Hex(dump.slice(0, size));
@@ -212,10 +333,12 @@ async function matchKnownFirmware() {
       }
     }
 
-    dumpMetadata.matches = matches;
-    dumpMetadata.catalogUrl = catalogUrl;
-    dumpMetadata.catalogSourceCommit = catalog.sourceCommit ?? null;
-    dumpMetadata.catalogSpikeRtCommit = catalog.spikeRtCommit ?? null;
+    if (dumpMetadata) {
+      dumpMetadata.matches = matches;
+      dumpMetadata.catalogUrl = catalogUrl;
+      dumpMetadata.catalogSourceCommit = catalog.sourceCommit ?? null;
+      dumpMetadata.catalogSpikeRtCommit = catalog.spikeRtCommit ?? null;
+    }
 
     if (matches.length > 0) {
       elements.matchStatus.textContent = `${matches.length}件一致`;
@@ -252,66 +375,228 @@ async function readHub() {
   if (!dfuDevice) return;
   setBusy(true);
   resetDumpResults("読み出し中");
-  elements.dumpStatus.className = "";
-  appendLog("SPIKE-RT領域の読み出しを開始します。フラッシュの消去・書き込みは行いません。");
-
+  appendLog("SPIKE-RT領域の読み出しを開始します。消去・書き込みは行いません。");
   try {
-    const reader = new SpikeRtReader(dfuDevice, {
-      log: appendLog,
-      onProgress: setProgress,
-    });
-    dump = await reader.read();
+    const reader = new SpikeRtReader(dfuDevice, { log: appendLog, onProgress: setProgress });
+    dump = await reader.read(SPIKE_RT_START_ADDRESS, SPIKE_RT_REGION_BYTES);
     const sha256 = await sha256Hex(dump);
-    const programmedBytes = estimateLastProgrammedByte(dump);
-    const vectors = readVectorTable(dump);
-
-    dumpMetadata = {
-      tool: "spike-rt-hub-dumper",
-      dumpedAt: new Date().toISOString(),
-      startAddress: hex(SPIKE_RT_START_ADDRESS),
-      endAddressExclusive: hex(SPIKE_FLASH_END_ADDRESS),
-      size: dump.byteLength,
-      sha256,
-      lastNonErasedOffset: programmedBytes,
-      estimatedProgrammedEndAddress:
-        programmedBytes > 0 ? hex(SPIKE_RT_START_ADDRESS + programmedBytes) : null,
-      vectorTable: {
-        initialStackPointer: vectors.initialStackPointer === null ? null : hex(vectors.initialStackPointer),
-        resetHandler: vectors.resetHandler === null ? null : hex(vectors.resetHandler),
-      },
-      matches: [],
-    };
-
-    elements.dumpStatus.textContent = "読み出し完了";
-    elements.dumpStatus.className = "status-good";
-    elements.dumpSize.textContent = formatBytes(dump.byteLength);
-    elements.dumpSha.textContent = sha256;
-    elements.programmedBytes.textContent =
-      programmedBytes > 0
-        ? `${formatBytes(programmedBytes)} / 推定終端 ${hex(SPIKE_RT_START_ADDRESS + programmedBytes)}`
-        : "すべて0xFF";
-    elements.stackPointer.textContent = hex(vectors.initialStackPointer);
-    elements.resetHandler.textContent = hex(vectors.resetHandler);
-    elements.progress.value = 100;
-    elements.progressLabel.textContent = `完了: ${formatBytes(dump.byteLength)}`;
-    appendLog(`読み出し完了: SHA-256 ${sha256}`);
-
+    dumpMetadata = createProgramMetadata(dump, sha256);
+    showProgramMetadata(dumpMetadata);
+    appendLog(`SPIKE-RT領域バックアップ完了: SHA-256 ${sha256}`);
     await matchKnownFirmware();
   } catch (error) {
     resetDumpResults("読み出し失敗");
     elements.dumpStatus.className = "status-error";
     elements.progressLabel.textContent = "失敗";
     appendLog(`読み出し失敗: ${error instanceof Error ? error.message : String(error)}`);
-    try {
-      await dfuDevice?.ensureIdle();
-    } catch (recoveryError) {
-      appendLog(
-        `DFU状態の復旧に失敗しました。Hubを接続し直してください: ${
-          recoveryError instanceof Error ? recoveryError.message : String(recoveryError)
-        }`,
-      );
-    }
   } finally {
+    setBusy(false);
+  }
+}
+
+async function readFullFlash() {
+  if (!dfuDevice) return;
+  setBusy(true);
+  resetFullResults("読み出し中");
+  appendLog("内部Flash 1 MiB全体の読み出しを開始します。これは読み出し専用です。");
+  try {
+    const reader = new SpikeRtReader(dfuDevice, { log: appendLog, onProgress: setFullProgress });
+    fullDump = await reader.read(SPIKE_FLASH_START_ADDRESS, SPIKE_FLASH_BYTES);
+    const fullSha = await sha256Hex(fullDump);
+    const prefixSha = await sha256Hex(fullDump.slice(0, PREFIX_BYTES));
+    const programSha = await sha256Hex(fullDump.slice(PREFIX_BYTES));
+    fullDumpMetadata = {
+      tool: "spike-rt-hub-dumper",
+      kind: "spike-prime-full-flash-backup-read-only",
+      dumpedAt: new Date().toISOString(),
+      startAddress: hex(SPIKE_FLASH_START_ADDRESS),
+      endAddressExclusive: hex(SPIKE_FLASH_END_ADDRESS),
+      size: fullDump.byteLength,
+      sha256: fullSha,
+      protectedPrefix: {
+        startAddress: hex(SPIKE_FLASH_START_ADDRESS),
+        endAddressExclusive: hex(SPIKE_RT_START_ADDRESS),
+        size: PREFIX_BYTES,
+        sha256: prefixSha,
+      },
+      spikeRtRegion: {
+        startAddress: hex(SPIKE_RT_START_ADDRESS),
+        endAddressExclusive: hex(SPIKE_FLASH_END_ADDRESS),
+        size: SPIKE_RT_REGION_BYTES,
+        sha256: programSha,
+      },
+      restorePolicy: "The built-in restore function never writes 0x08000000-0x08008000.",
+    };
+    elements.fullStatus.textContent = "読み出し完了";
+    elements.fullStatus.className = "status-good";
+    elements.fullSize.textContent = formatBytes(fullDump.byteLength);
+    elements.fullSha.textContent = fullSha;
+    elements.prefixSha.textContent = prefixSha;
+    elements.fullProgramSha.textContent = programSha;
+    elements.fullProgress.value = 100;
+    elements.fullProgressLabel.textContent = `完了: ${formatBytes(fullDump.byteLength)}`;
+    appendLog(`1 MiB全Flashバックアップ完了: SHA-256 ${fullSha}`);
+    if (dumpMetadata && dumpMetadata.sha256 === programSha) {
+      appendLog("全Flash内のSPIKE-RT領域SHA-256は、992 KiBバックアップと一致しています。");
+    }
+  } catch (error) {
+    resetFullResults("読み出し失敗");
+    elements.fullStatus.className = "status-error";
+    elements.fullProgressLabel.textContent = "失敗";
+    appendLog(`全Flash読み出し失敗: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function normalizeAddress(value) {
+  return String(value ?? "").toLowerCase();
+}
+
+function evaluateRestoreMetadata() {
+  restoreMetadataValid = true;
+  elements.restoreMetadataStatus.className = "";
+  if (!restoreMetadataObject) {
+    elements.restoreMetadataStatus.textContent = "未選択（任意）";
+    updateControls();
+    return;
+  }
+  try {
+    if (normalizeAddress(restoreMetadataObject.startAddress) !== "0x08008000") {
+      throw new Error("startAddressが0x08008000ではありません");
+    }
+    if (normalizeAddress(restoreMetadataObject.endAddressExclusive) !== "0x08100000") {
+      throw new Error("endAddressExclusiveが0x08100000ではありません");
+    }
+    if (Number(restoreMetadataObject.size) !== SPIKE_RT_REGION_BYTES) {
+      throw new Error("sizeが992 KiBではありません");
+    }
+    const metadataSha = String(restoreMetadataObject.sha256 ?? "").toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(metadataSha)) throw new Error("SHA-256がありません");
+    if (restoreImageSha && metadataSha !== restoreImageSha.toLowerCase()) {
+      throw new Error("選択したbinのSHA-256と一致しません");
+    }
+    elements.restoreMetadataStatus.textContent = restoreImageSha
+      ? "binとSHA-256一致"
+      : "形式OK・bin選択待ち";
+    elements.restoreMetadataStatus.className = "status-good";
+  } catch (error) {
+    restoreMetadataValid = false;
+    elements.restoreMetadataStatus.textContent = `不一致: ${error instanceof Error ? error.message : String(error)}`;
+    elements.restoreMetadataStatus.className = "status-error";
+  }
+  updateControls();
+}
+
+async function selectRestoreFile() {
+  restoreImage = null;
+  restoreImageSha = null;
+  elements.restoreFileStatus.textContent = "未選択";
+  elements.restoreFileStatus.className = "";
+  elements.restoreFileSize.textContent = "—";
+  elements.restoreFileSha.textContent = "—";
+  elements.restoreStatus.textContent = "未実行";
+  elements.restoreStatus.className = "";
+  elements.restoreReadbackSha.textContent = "—";
+  elements.restoreConfirm.checked = false;
+  const file = elements.restoreFile.files?.[0];
+  if (!file) {
+    evaluateRestoreMetadata();
+    updateControls();
+    return;
+  }
+  setBusy(true);
+  try {
+    const buffer = await file.arrayBuffer();
+    validateRestoreImage(buffer);
+    const sha = await sha256Hex(buffer);
+    restoreImage = buffer;
+    restoreImageSha = sha;
+    elements.restoreFileStatus.textContent = `${file.name} / 使用可能`;
+    elements.restoreFileStatus.className = "status-good";
+    elements.restoreFileSize.textContent = formatBytes(buffer.byteLength);
+    elements.restoreFileSha.textContent = sha;
+    appendLog(`復元ファイルを検査しました: ${file.name}, SHA-256 ${sha}`);
+  } catch (error) {
+    elements.restoreFileStatus.textContent = `使用不可: ${error instanceof Error ? error.message : String(error)}`;
+    elements.restoreFileStatus.className = "status-error";
+    appendLog(`復元ファイル拒否: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    setBusy(false);
+    evaluateRestoreMetadata();
+  }
+}
+
+async function selectRestoreMetadata() {
+  restoreMetadataObject = null;
+  const file = elements.restoreMetadata.files?.[0];
+  if (!file) {
+    evaluateRestoreMetadata();
+    return;
+  }
+  setBusy(true);
+  try {
+    restoreMetadataObject = JSON.parse(await file.text());
+  } catch (error) {
+    restoreMetadataValid = false;
+    elements.restoreMetadataStatus.textContent = `読込失敗: ${error instanceof Error ? error.message : String(error)}`;
+    elements.restoreMetadataStatus.className = "status-error";
+  } finally {
+    setBusy(false);
+    if (restoreMetadataObject) evaluateRestoreMetadata();
+    else updateControls();
+  }
+}
+
+async function restoreHub() {
+  if (!dfuDevice || !restoreImage || !restoreImageSha || !restoreMetadataValid) return;
+  if (!elements.restoreConfirm.checked) return;
+  const accepted = window.confirm(
+    `SPIKE-RT領域 0x08008000–0x08100000 を消去してバックアップへ復元します。\n\nSHA-256:\n${restoreImageSha}\n\n先頭32 KiB (0x08000000–0x08008000) は変更しません。\n続行しますか？`,
+  );
+  if (!accepted) {
+    appendLog("復元操作をキャンセルしました。");
+    return;
+  }
+
+  setBusy(true);
+  elements.restoreStatus.textContent = "復元中";
+  elements.restoreStatus.className = "status-warn";
+  elements.restoreReadbackSha.textContent = "—";
+  elements.restoreProgress.value = 0;
+  elements.restoreProgressLabel.textContent = "復元準備中";
+  appendLog(`復元開始: expected SHA-256 ${restoreImageSha}`);
+
+  try {
+    const restorer = new SpikeRtRestorer(dfuDevice, {
+      log: appendLog,
+      onProgress: setRestoreProgress,
+    });
+    const readback = await restorer.restore(restoreImage);
+    const readbackSha = await sha256Hex(readback);
+    elements.restoreReadbackSha.textContent = readbackSha;
+    if (readbackSha.toLowerCase() !== restoreImageSha.toLowerCase()) {
+      throw new Error(`最終SHA-256が一致しません: ${readbackSha}`);
+    }
+
+    elements.restoreStatus.textContent = "完全一致・復元完了";
+    elements.restoreStatus.className = "status-good";
+    elements.restoreProgress.value = 100;
+    elements.restoreProgressLabel.textContent = "完了: 992 KiB全域検証済み";
+    appendLog(`復元完了: 読み戻しSHA-256 ${readbackSha}（元バックアップと完全一致）`);
+    appendLog("先頭32 KiBは変更していません。USBを抜いてHubを通常起動できます。");
+
+    dump = readback;
+    dumpMetadata = createProgramMetadata(readback, readbackSha, "post-restore-readback");
+    showProgramMetadata(dumpMetadata);
+  } catch (error) {
+    elements.restoreStatus.textContent = "復元失敗・Hubを通常起動する前に確認してください";
+    elements.restoreStatus.className = "status-error";
+    elements.restoreProgressLabel.textContent = "失敗";
+    appendLog(`復元失敗: ${error instanceof Error ? error.message : String(error)}`);
+    appendLog("復元失敗時はUSBを抜かず、ログを保存して再接続・再復元を検討してください。");
+  } finally {
+    elements.restoreConfirm.checked = false;
     setBusy(false);
   }
 }
@@ -325,6 +610,7 @@ elements.browserStatus.className = isWebUsbAvailable() ? "status-good" : "status
 elements.connect.addEventListener("click", connectHub);
 elements.disconnect.addEventListener("click", disconnectHub);
 elements.read.addEventListener("click", readHub);
+elements.readFull.addEventListener("click", readFullFlash);
 elements.retryMatch.addEventListener("click", async () => {
   setBusy(true);
   try {
@@ -333,6 +619,11 @@ elements.retryMatch.addEventListener("click", async () => {
     setBusy(false);
   }
 });
+elements.restoreFile.addEventListener("change", selectRestoreFile);
+elements.restoreMetadata.addEventListener("change", selectRestoreMetadata);
+elements.restoreConfirm.addEventListener("change", updateControls);
+elements.restore.addEventListener("click", restoreHub);
+
 elements.downloadBin.addEventListener("click", () => {
   if (!dump) return;
   downloadBlob(new Blob([dump], { type: "application/octet-stream" }), dumpFilename());
@@ -341,7 +632,18 @@ elements.downloadMetadata.addEventListener("click", () => {
   if (!dumpMetadata) return;
   downloadBlob(
     new Blob([`${JSON.stringify(dumpMetadata, null, 2)}\n`], { type: "application/json" }),
-    "spike-rt-dump-metadata.json",
+    "spike-rt-program-backup-metadata.json",
+  );
+});
+elements.downloadFullBin.addEventListener("click", () => {
+  if (!fullDump) return;
+  downloadBlob(new Blob([fullDump], { type: "application/octet-stream" }), fullDumpFilename());
+});
+elements.downloadFullMetadata.addEventListener("click", () => {
+  if (!fullDumpMetadata) return;
+  downloadBlob(
+    new Blob([`${JSON.stringify(fullDumpMetadata, null, 2)}\n`], { type: "application/json" }),
+    "spike-prime-full-flash-metadata.json",
   );
 });
 
@@ -353,4 +655,6 @@ navigator.usb?.addEventListener?.("disconnect", (event) => {
 });
 
 resetDumpResults();
+resetFullResults();
+evaluateRestoreMetadata();
 updateControls();
