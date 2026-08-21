@@ -5,6 +5,7 @@ export const SPIKE_FLASH_END_ADDRESS = 0x08100000;
 export const SPIKE_RT_REGION_BYTES = SPIKE_FLASH_END_ADDRESS - SPIKE_RT_START_ADDRESS;
 
 const DFUSE_SET_ADDRESS = 0x21;
+const STM32_INTERNAL_FLASH_MAX_UPLOAD = 2048;
 
 function commandPayload(command, address) {
   const payload = new ArrayBuffer(5);
@@ -54,15 +55,18 @@ export class SpikeRtReader {
     length = SPIKE_RT_REGION_BYTES,
   ) {
     validateRange(startAddress, length);
-    const transferSize = this.device.transferSize;
-    if (!Number.isInteger(transferSize) || transferSize <= 0) {
-      throw new Error(`DFU転送サイズが不正です: ${transferSize}`);
+    if (!Number.isInteger(this.device.transferSize) || this.device.transferSize <= 0) {
+      throw new Error(`DFU転送サイズが不正です: ${this.device.transferSize}`);
     }
+    const transferSize = Math.min(
+      this.device.transferSize,
+      STM32_INTERNAL_FLASH_MAX_UPLOAD,
+    );
 
     this.log(
       `読み出し範囲: 0x${startAddress.toString(16)}–0x${(startAddress + length).toString(16)} (${length} bytes)`,
     );
-    this.log(`DFU転送サイズ: ${transferSize} bytes`);
+    this.log(`DFU読み出し転送サイズ: ${transferSize} bytes`);
     this.onProgress(0, length);
 
     await this.device.ensureIdle();
