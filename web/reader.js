@@ -41,6 +41,10 @@ function hexAddress(address) {
   return `0x${address.toString(16).padStart(8, "0")}`;
 }
 
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 export class SpikeRtReader {
   constructor(device, callbacks = {}) {
     this.device = device;
@@ -49,20 +53,57 @@ export class SpikeRtReader {
   }
 
   async setAddress(address) {
-    await this.device.download(commandPayload(DFUSE_SET_ADDRESS, address), 0);
-    const status = await this.device.pollUntil(
-      (current) => current.state === DFU_STATE.DNLOAD_IDLE,
-    );
-    if (status.status !== DFU_STATUS_OK || status.state !== DFU_STATE.DNLOAD_IDLE) {
-      throw new Error(
-        `読み出しアドレス設定に失敗しました (state=${status.state}, status=${status.status})。`,
+    try {
+      await this.device.download(commandPayload(DFUSE_SET_ADDRESS, address), 0);
+      const status = await this.device.pollUntil(
+        (current) => current.state === DFU_STATE.DNLOAD_IDLE,
       );
+      if (status.status !== DFU_STATUS_OK || status.state !== DFU_STATE.DNLOAD_IDLE) {
+        throw new Error(`state=${status.state}, status=${status.status}`);
+      }
+    } catch (error) {
+      throw new Error(
+        `${hexAddress(address)} のSet Address Pointerに失敗しました: ${asMessage(error)}`,
+      );
+    }
+  }
+
+  // dfu-util の dfu_abort_to_idle() と同じ順序:
+  // DFU_ABORT -> DFU_GETSTATUS -> dfuIDLE確認。
+  // GETSTATE は使用しない。SPIKE Prime + WinUSB/WebUSB では
+  // GETSTATE が約5秒後に transfer error となる実機挙動が確認されたため。
+  async abortTransferToIdle(context) {
+    try {
+      await this.device.abort();
+      const status = await this.device.getStatus();
+      if (status.pollTimeout > 0) {
+        await sleep(status.pollTimeout);
+      }
+      if (status.status !== DFU_STATUS_OK || status.state !== DFU_STATE.IDLE) {
+        throw new Error(`state=${status.state}, status=${status.status}`);
+      }
+    } catch (error) {
+      throw new Error(`${context}後のDFU_ABORT/GETSTATUSに失敗しました: ${asMessage(error)}`);
     }
   }
 
   async recoverToIdle() {
     try {
-      await this.device.abortToIdle();
+      let status = await this.device.getStatus();
+      if (status.state === DFU_STATE.ERROR) {
+        await this.device.clearStatus();
+        status = await this.device.getStatus();
+      }
+      if (status.state !== DFU_STATE.IDLE) {
+        await this.device.abort();
+        status = await this.device.getStatus();
+      }
+      if (status.pollTimeout > 0) {
+        await sleep(status.pollTimeout);
+      }
+      if (status.status !== DFU_STATUS_OK || status.state !== DFU_STATE.IDLE) {
+        throw new Error(`state=${status.state}, status=${status.status}`);
+      }
       return true;
     } catch (error) {
       this.log(`DFU状態の復旧に失敗しました: ${asMessage(error)}`);
@@ -73,9 +114,8 @@ export class SpikeRtReader {
   async readWindow(output, outputOffset, windowAddress, windowLength, transferSize) {
     for (let attempt = 1; attempt <= READ_WINDOW_ATTEMPTS; attempt += 1) {
       try {
-        await this.device.abortToIdle();
         await this.setAddress(windowAddress);
-        await this.device.abortToIdle();
+        await this.abortTransferToIdle("Set Address Pointer");
 
         let windowOffset = 0;
         let blockNumber = 2;
@@ -104,7 +144,7 @@ export class SpikeRtReader {
           this.onProgress(outputOffset + windowOffset, SPIKE_RT_REGION_BYTES);
         }
 
-        await this.device.abortToIdle();
+        await this.abortTransferToIdle("UPLOAD");
         return;
       } catch (error) {
         const message = asMessage(error);
@@ -117,7 +157,7 @@ export class SpikeRtReader {
             `区間 ${hexAddress(windowAddress)}–${hexAddress(windowAddress + windowLength)} を読み出せませんでした: ${message}`,
           );
         }
-        this.log(`同じ区間をアドレス設定からやり直します。`);
+        this.log("同じ区間をアドレス設定からやり直します。");
       }
     }
   }
@@ -144,6 +184,7 @@ export class SpikeRtReader {
     this.log(
       `安定化モード: 最大${windowBytes} bytesごとにSet Address Pointerを再設定し、UPLOAD blockを2から再開します。`,
     );
+    this.log("DFU状態復帰: dfu-util互換のABORT → GETSTATUS方式を使用します（GETSTATEは使用しません）。");
     this.onProgress(0, length);
 
     await this.device.ensureIdle();
